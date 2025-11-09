@@ -144,6 +144,35 @@ Features:
 
 ## Configuration
 
+### 🎊 Holiday Management
+
+**Automatic Holiday Detection:**
+- Gesetzliche Feiertage werden automatisch für dein Bundesland erkannt
+- Standard: Bayern (`BY`). Ändere in `untis_sync_improved.py`:
+
+```python
+parser = ImprovedUntisParser('weekly_data/week_1.json', bundesland='BY')
+# BY=Bayern, NW=NRW, BW=Baden-Württemberg, HE=Hessen, SN=Sachsen, etc.
+```
+
+**Manual School Holidays:**
+Schulfreie Tage die keine gesetzlichen Feiertage sind (z.B. Buß- und Bettag außerhalb Sachsen, Brückentage, pädagogische Tage) in `school_holidays.json` eintragen:
+
+```json
+{
+  "custom_holidays": [
+    "2025-11-19",
+    "2025-05-30",
+    "2025-03-15"
+  ]
+}
+```
+
+Das System erkennt automatisch:
+- ✅ Fehlende Wochentage in WebUntis-Daten
+- ✅ Ordnet Lessons korrekt zu (ohne Day-Shift)
+- ✅ Funktioniert für **jeden Wochentag** (nicht nur Mittwoch)
+
 ### Color Coding
 
 Events are color-coded in Google Calendar (default: Orange).

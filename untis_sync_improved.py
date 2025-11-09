@@ -12,6 +12,8 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import os
 import pickle
+import holidays
+from pathlib import Path
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -79,11 +81,27 @@ class UntisLesson:
 class ImprovedUntisParser:
     """Verbesserter Parser der mehrere Tage/Wochen unterstützt"""
     
-    def __init__(self, json_file: str):
+    def __init__(self, json_file: str, bundesland: str = 'BY'):
         with open(json_file, 'r', encoding='utf-8') as f:
             self.data = json.load(f)
         
         self.base_date = self._extract_date_from_url()
+        
+        # Initialisiere deutsche Feiertage für das entsprechende Bundesland
+        year = int(self.base_date[:4])
+        self.holidays = holidays.Germany(years=year, prov=bundesland)
+        
+        # Lade manuelle schulfreie Tage
+        custom_holidays_file = Path(__file__).parent / 'school_holidays.json'
+        if custom_holidays_file.exists():
+            with open(custom_holidays_file, 'r', encoding='utf-8') as f:
+                custom_data = json.load(f)
+                for date_str in custom_data.get('custom_holidays', []):
+                    date_obj = datetime.strptime(date_str, '%Y-%m-%d').date()
+                    self.holidays[date_obj] = 'Schulfrei (manuell konfiguriert)'
+                print(f"  → {len(custom_data.get('custom_holidays', []))} manuelle schulfreie Tage geladen")
+        
+        print(f"  → Feiertage geladen für {bundesland} {year} + manuelle Einträge")
         
     def _extract_date_from_url(self) -> str:
         """Extrahiert das Datum aus der URL"""
@@ -102,61 +120,135 @@ class ImprovedUntisParser:
         print(f"Basis-Datum aus URL: {self.base_date}")
         
         # Versuche die Wochenstruktur zu erkennen
-        current_day_offset = 0  # Montag = 0, Dienstag = 1, etc.
-        last_start_time = None
-        last_lesson_card_index = -1
+        # Montag des base_date ermitteln (Wochenanfang)
+        base = datetime.strptime(self.base_date, '%Y-%m-%d')
+        # Finde den Montag dieser Woche
+        days_since_monday = base.weekday()  # 0=Monday, 6=Sunday
+        week_start = base - timedelta(days=days_since_monday)
         
+        # NEUE STRATEGIE: Gruppiere Lessons nach Tagen
+        # Sammle erst alle Lessons mit ihrer Zeit
+        lesson_groups = []  # [(index, start_time), ...]
+        
+        for i, lesson in enumerate(raw_lessons):
+            class_name = lesson.get('className', '')
+            text = lesson.get('text', '').strip()
+            
+            if 'lesson-card ' in class_name or class_name.startswith('lesson-card '):
+                time_match = re.search(r'(\d{2}):(\d{2})', text)
+                if time_match:
+                    start_time = f"{time_match.group(1)}:{time_match.group(2)}"
+                    lesson_groups.append((i, start_time))
+        
+        # Erkenne Tagwechsel durch Zeit-Rücksprünge
+        day_boundaries = [0]  # Erste Lesson ist immer Start von Tag 0
+        for idx, (i, time) in enumerate(lesson_groups[1:], start=1):
+            prev_time = lesson_groups[idx-1][1]
+            if time < prev_time:  # Zeit springt zurück = neuer Tag
+                day_boundaries.append(idx)
+        
+        print(f"  → Erkannte Tagesgrenzen bei Lesson-Indices: {day_boundaries}")
+        print(f"  → Das entspricht {len(day_boundaries)} Tagen in den Daten")
+        
+        # Zähle Lessons pro Tag-Block um fehlende Tage zu erkennen
+        day_lesson_counts = []
+        for day_idx, boundary_start in enumerate(day_boundaries):
+            if day_idx < len(day_boundaries) - 1:
+                boundary_end = day_boundaries[day_idx + 1]
+            else:
+                boundary_end = len(lesson_groups)
+            lesson_count = boundary_end - boundary_start
+            day_lesson_counts.append(lesson_count)
+        
+        print(f"  → Lessons pro Tag: {day_lesson_counts}")
+        
+        # INTELLIGENTE FEIERTAGS-ERKENNUNG
+        # Prüfe welche Wochentage in dieser Woche Feiertage sind
+        num_days_detected = len(day_boundaries)
+        
+        # Erstelle Liste aller Wochentage (Mo-Fr = 0-4)
+        all_weekdays = list(range(5))  # [0, 1, 2, 3, 4]
+        
+        # Prüfe welche Tage Feiertage sind
+        holiday_weekdays = []
+        for weekday in range(5):  # Mo-Fr
+            date = week_start + timedelta(days=weekday)
+            if date in self.holidays:
+                holiday_name = self.holidays.get(date)
+                print(f"  🎊 Feiertag erkannt: {date.strftime('%Y-%m-%d')} ({['Mo','Di','Mi','Do','Fr'][weekday]}) = {holiday_name}")
+                holiday_weekdays.append(weekday)
+        
+        # Berechne welche Tage Schultage sind (ohne Feiertage)
+        school_days = [d for d in all_weekdays if d not in holiday_weekdays]
+        expected_days = len(school_days)
+        
+        print(f"  → Erwartete Schultage: {expected_days} (ohne {len(holiday_weekdays)} Feiertage)")
+        
+        # Mapping: Welcher Tag-Index gehört zu welchem Wochentag?
+        if num_days_detected == expected_days:
+            # Perfekt: Anzahl passt
+            weekday_mapping = school_days
+            print(f"  ✓ Mapping: {num_days_detected} Tage → {[['Mo','Di','Mi','Do','Fr'][w] for w in weekday_mapping]}")
+        elif num_days_detected < expected_days:
+            # Weniger Tage als erwartet - nimm die ersten N Schultage
+            weekday_mapping = school_days[:num_days_detected]
+            print(f"  ⚠ Nur {num_days_detected} Tage erkannt, erwartet {expected_days}")
+            print(f"  → Mapping: {[['Mo','Di','Mi','Do','Fr'][w] for w in weekday_mapping]}")
+        else:
+            # Mehr Tage als erwartet - sollte nicht passieren, aber fallback
+            print(f"  ⚠ Mehr Tage ({num_days_detected}) als erwartet ({expected_days})!")
+            weekday_mapping = list(range(num_days_detected))
+        
+        # Weise jedem Lesson-Index den richtigen Wochentag zu
+        lesson_to_weekday = {}
+        for day_idx, boundary_start in enumerate(day_boundaries):
+            if day_idx < len(day_boundaries) - 1:
+                boundary_end = day_boundaries[day_idx + 1]
+            else:
+                boundary_end = len(lesson_groups)
+            
+            lesson_count = boundary_end - boundary_start
+            actual_weekday = weekday_mapping[day_idx]
+            weekday_name = ['Mo','Di','Mi','Do','Fr','Sa','So'][actual_weekday]
+            
+            # Weise alle Lessons in diesem Block zum richtigen Wochentag zu
+            for lesson_idx in range(boundary_start, boundary_end):
+                actual_index = lesson_groups[lesson_idx][0]
+                lesson_to_weekday[actual_index] = actual_weekday
+            
+            print(f"  → Tag-Block {day_idx} ({lesson_count} Lessons) → Wochentag {actual_weekday} ({weekday_name})")
+        
+        # Parse alle Lessons mit dem richtigen Wochentag
         i = 0
         while i < len(raw_lessons):
             lesson = raw_lessons[i]
             class_name = lesson.get('className', '')
-            text = lesson.get('text', '').strip()
             
-            # Prüfe ob das ein Lesson-Card Container ist
-            # Nur die Haupt-lesson-card zählt (nicht lesson-card-container, etc.)
             if 'lesson-card ' in class_name or class_name.startswith('lesson-card '):
-                # Extrahiere Zeit aus diesem Lesson
-                time_match = re.search(r'(\d{2}):(\d{2})', text)
-                if time_match:
-                    current_time = f"{time_match.group(1)}:{time_match.group(2)}"
-                    
-                    # Wenn die Zeit KLEINER ist als die letzte Zeit UND
-                    # wir haben schon mindestens eine Lesson gesehen,
-                    # dann ist das ein neuer Tag
-                    if last_start_time and current_time < last_start_time:
-                        current_day_offset += 1
-                        print(f"  → Tag wechsel erkannt bei Index {i}: {last_start_time} → {current_time}, jetzt Tag {current_day_offset}")
-                    
-                    last_start_time = current_time
-                
-                # Parse diese Lesson
-                parsed = self._parse_lesson_card(raw_lessons, i, current_day_offset)
-                if parsed:
-                    lessons.append(parsed)
-                    print(f"  ✓ Tag {current_day_offset} → {parsed.date} ({datetime.strptime(parsed.date, '%Y-%m-%d').strftime('%A')}): {parsed.start_time}-{parsed.end_time} {parsed.subject} @ {parsed.room}")
-                
-                last_lesson_card_index = i
+                if i in lesson_to_weekday:
+                    weekday = lesson_to_weekday[i]
+                    parsed = self._parse_lesson_card(raw_lessons, i, week_start, weekday)
+                    if parsed:
+                        lessons.append(parsed)
+                        print(f"  ✓ {parsed.date} ({datetime.strptime(parsed.date, '%Y-%m-%d').strftime('%A')}): {parsed.start_time}-{parsed.end_time} {parsed.subject} @ {parsed.room}")
             
             i += 1
         
         # Sortiere nach Datum und Zeit
         lessons.sort(key=lambda l: (l.date, l.start_time))
         
-        print(f"\n✓ {len(lessons)} Lessons über {current_day_offset + 1} Tage gefunden")
+        # Zähle eindeutige Tage
+        unique_days = len(set(l.date for l in lessons))
+        print(f"\n✓ {len(lessons)} Lessons über {unique_days} Tage gefunden")
         
         return lessons
     
-    def _parse_lesson_card(self, lessons_list: List[Dict], start_index: int, day_offset: int) -> Optional[UntisLesson]:
+    def _parse_lesson_card(self, lessons_list: List[Dict], start_index: int, week_start: datetime, weekday: int) -> Optional[UntisLesson]:
         """Parst eine einzelne Lesson-Card"""
         try:
-            # Berechne das Datum basierend auf day_offset
-            base = datetime.strptime(self.base_date, '%Y-%m-%d')
-            
-            # Wenn base_date ein Montag ist, addiere day_offset Tage
-            # Ansonsten finde den Montag dieser Woche
-            weekday = base.weekday()  # 0 = Montag
-            monday = base - timedelta(days=weekday)
-            lesson_date = monday + timedelta(days=day_offset)
+            # Berechne das echte Datum basierend auf Wochentag
+            # week_start ist Montag, weekday 0=Mo, 1=Di, 2=Mi, ...
+            lesson_date = week_start + timedelta(days=weekday)
             lesson_date_str = lesson_date.strftime('%Y-%m-%d')
             
             main_text = lessons_list[start_index].get('text', '').strip()
